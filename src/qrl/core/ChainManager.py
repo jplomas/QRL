@@ -1,6 +1,11 @@
 # coding=utf-8
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+"""ChainManager: owns the chain's state.
+
+Adding and validating blocks, fork detection and recovery, and applying/reverting
+transaction state changes against the state DB.
+"""
 import sys
 import threading
 from collections import OrderedDict
@@ -328,6 +333,8 @@ class ChainManager:
             return dev_config
 
     def get_seed_block(self, blockheader: BlockHeader):
+        if not blockheader:
+            return None
         qn = Qryptonight()
         seed_height = qn.get_seed_height(blockheader.block_number)
 
@@ -616,6 +623,10 @@ class ChainManager:
                 self._state.put_state_version()
 
     def _update_chainstate(self, block: Block, batch):
+        """
+        Make `block` the new chain tip: update the last-block/height pointers,
+        remove its transactions from the pool, and write transaction metadata.
+        """
         self._last_block = block
         self._update_block_number_mapping(block, batch)
         self.tx_pool.remove_tx_in_block_from_pool(block)
@@ -698,19 +709,22 @@ class ChainManager:
         tmp_block = block
         hash_path = []
         while True:
-            if not block:
-                raise Exception('[get_state] No Block Found %s, Initiator %s', block.headerhash, tmp_block.headerhash)
-
             mainchain_block = Block.get_block_by_number(self._state, block.block_number)
             if mainchain_block and mainchain_block.headerhash == block.headerhash:
                 break
 
-            if block.block_number == 0:
-                raise Exception('[get_state] Alternate chain genesis is different, Initiator %s', tmp_block.headerhash)
-            hash_path.append(block.headerhash)
-            block = Block.get_block(self._state, block.prev_headerhash)
+            if block.block_number <= self.re_org_limit:
+                return None, [], True
 
-        return block.headerhash, hash_path
+            if block.block_number == 0:
+                raise Exception('[_get_fork_point] Alternate chain genesis is different, Initiator %s' % bin2hstr(tmp_block.headerhash))
+            hash_path.append(block.headerhash)
+            new_block = Block.get_block(self._state, block.prev_headerhash)
+            if not new_block:
+                raise Exception('[_get_fork_point] No Block Found %s, Initiator %s' % (bin2hstr(block.prev_headerhash), bin2hstr(tmp_block.headerhash)))
+            block = new_block
+
+        return block.headerhash, hash_path, False
 
     def _rollback(self, forked_header_hash: bytes, fork_state: qrlstateinfo_pb2.ForkState = None):
         """
@@ -722,13 +736,14 @@ class ChainManager:
         hash_path = []
         while self._last_block.headerhash != forked_header_hash:
             block = Block.get_block(self._state, self._last_block.headerhash)
-            mainchain_block = Block.get_block_by_number(self._state, block.block_number)
-
             if block is None:
                 logger.warning("self.state.get_block(self.last_block.headerhash) returned None")
+                return hash_path, False
 
+            mainchain_block = Block.get_block_by_number(self._state, block.block_number)
             if mainchain_block is None:
                 logger.warning("self.get_block_by_number(block.block_number) returned None")
+                return hash_path, False
 
             if block.headerhash != mainchain_block.headerhash:
                 break
@@ -774,6 +789,21 @@ class ChainManager:
                 if not self._apply_state_changes(block, batch):
                     return False
 
+                # Re-persist the block after applying it. _apply_state_changes()
+                # mutates apply-time transaction fields on the in-memory block
+                # object (e.g. MultiSigVote.prev_tx_hash, which is derived from
+                # VoteStats during application and is not part of the signed tx
+                # data). On the canonical-tip path these mutations are already
+                # captured because _try_branch_add_block() applies before it
+                # calls put_block(). A side branch, however, is persisted before
+                # it is applied, so without re-persisting here the stored block
+                # bytes stay stale. A later reorg or restart that rolls this
+                # block back loads the stale bytes and feeds an inconsistent
+                # prev_tx_hash into VoteStats.revert_vote_stats(), corrupting
+                # vote history. Writing the normalized block back keeps storage
+                # consistent with applied state.
+                Block.put_block(self._state, block, batch)
+
                 self._update_chainstate(block, batch)
 
                 logger.debug('Apply block #%d - [batch %d | %s]', block.block_number, i, hash_path[i])
@@ -784,13 +814,27 @@ class ChainManager:
             return True
 
     def _fork_recovery(self, block: Block, fork_state: qrlstateinfo_pb2.ForkState) -> bool:
+        """
+        Switch the main chain to the branch ending at `block` when it wins.
+
+        Finds the fork point, rolls the state back to it, and replays the new
+        branch; if replay fails it restores the old chain. Fork progress is
+        persisted in `fork_state` so an interrupted recovery can resume. Returns
+        True on a successful switch, False if it bailed (e.g. beyond re-org limit).
+        """
         logger.info("Triggered Fork Recovery")
         # This condition only becomes true, when fork recovery was interrupted
         if fork_state.fork_point_headerhash:
             logger.info("Recovering from last fork recovery interruption")
             forked_header_hash, hash_path = fork_state.fork_point_headerhash, fork_state.new_mainchain_hash_path
         else:
-            forked_header_hash, hash_path = self._get_fork_point(block)
+            forked_header_hash, hash_path, beyond_re_org_limit = self._get_fork_point(block)
+            if beyond_re_org_limit:
+                logger.info('[_fork_recovery] Block #%s hash %s | current height %d | beyond re-org limit',
+                            block.block_number, bin2hstr(block.headerhash), self.height)
+                self._state.delete_fork_state()
+                self.trigger_miner = True
+                return False
             fork_state.fork_point_headerhash = forked_header_hash
             fork_state.new_mainchain_hash_path.extend(hash_path)
             self._state.put_fork_state(fork_state)
@@ -822,6 +866,7 @@ class ChainManager:
         return True
 
     def _add_block(self, block, check_stale=True) -> bool:
+        """Enforce the block-size limit, then attempt to add the block to a branch."""
         dev_config = self.get_config_by_block_number(block.block_number)
         self.trigger_miner = False
 
@@ -833,6 +878,12 @@ class ChainManager:
         return self._try_branch_add_block(block, dev_config, check_stale)
 
     def add_block(self, block: Block, check_stale=True) -> bool:
+        """
+        Add a block to the chain (thread-safe entry point).
+
+        Skips blocks below the re-org limit or already known, then delegates to
+        _add_block. Returns True only if the block was added.
+        """
         with self.lock:
             if block.block_number <= self.re_org_limit:
                 logger.debug('Skipping block #%s as beyond re-org limit', block.block_number)
@@ -1010,6 +1061,11 @@ class ChainManager:
                                       votes_stats)
 
     def _apply_state_changes(self, block, batch) -> bool:
+        """
+        Validate and apply every transaction in `block` to the state, updating
+        balances and paginated indexes. Rejects a second coinbase (except the
+        historical block 2078158). Returns False if any transaction is invalid.
+        """
         state_container = self.new_state_container(set(),
                                                    block.block_number,
                                                    True,
@@ -1177,6 +1233,13 @@ class ChainManager:
             elif MultiSigAddressState.address_is_valid(address):
                 multi_sig_address_state = MultiSigAddressState.get_multi_sig_address_state_by_address(self._state._db,
                                                                                                       address)
+                # A syntactically valid multi-sig address (0x11 prefix, valid checksum) need not
+                # exist in the DB - e.g. a transfer whose addr_to is a crafted nonexistent multi-sig
+                # address. Reject cleanly here instead of dereferencing None on .signatories below
+                # (consistent with the `return None, False` rejections elsewhere in this method).
+                # This lets the transaction fail validation gracefully rather than raising.
+                if multi_sig_address_state is None:
+                    return None, False
                 addresses_state[address] = multi_sig_address_state
 
                 # Load Address State of signatories as it needs to be processed by MultiSigSpend Txn
@@ -1273,6 +1336,10 @@ class ChainManager:
         return data_point
 
     def get_unused_ots_index2(self, address, start_ots_index=0):
+        """
+        Convenience wrapper for get_unused_ots_index that reads bitfield pages
+        straight from the state DB (no pre-loaded caches).
+        """
         return self.get_unused_ots_index(addresses_bitfield=dict(),
                                          addresses_state=dict(),
                                          address=address,
@@ -1298,22 +1365,20 @@ class ChainManager:
         if address_state.ots_bitfield_used_page == max_page:
             return None
 
-        page = max(address_state.ots_bitfield_used_page, start_ots_index // config.dev.ots_tracking_per_page) + 1
-
-        for i in range((page - 1) * config.dev.ots_tracking_per_page // 8, ots_key_count // 8):
-            page = (i // config.dev.ots_tracking_per_page) + 1
+        for curr_ots in range(start_ots_index, ots_key_count):
+            page = (curr_ots // config.dev.ots_tracking_per_page) + 1
             key = paginated_bitfield.generate_bitfield_key(address, page)
             if key not in addresses_bitfield:
                 addresses_bitfield[key] = paginated_bitfield.get_paginated_data(address, page)
 
             ots_bitfield = addresses_bitfield[key]
-            index = i % config.dev.ots_tracking_per_page
+            index = (curr_ots % config.dev.ots_tracking_per_page) >> 3
             if ots_bitfield[index][0] < 255:
-                offset = 8 * index + (page - 1) * config.dev.ots_tracking_per_page
+                ots_offset = 8 * index + (page - 1) * config.dev.ots_tracking_per_page
                 bitfield = bytearray(ots_bitfield[index])
                 for relative in range(0, 8):
                     if ((bitfield[0] >> relative) & 1) != 1:
-                        if offset + relative >= start_ots_index:
-                            return offset + relative
+                        if ots_offset + relative >= start_ots_index:
+                            return ots_offset + relative
 
         return None

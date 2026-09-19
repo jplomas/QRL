@@ -1,6 +1,11 @@
 # coding=utf-8
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+"""Block: the on-chain block structure.
+
+Assembly (create), consensus validation (validate), and helpers for persisting
+and reading blocks from the state DB.
+"""
 from collections import OrderedDict
 from statistics import median
 from typing import Optional
@@ -15,7 +20,6 @@ from qrl.core.txs.Transaction import Transaction
 from qrl.core.txs.CoinBase import CoinBase
 from qrl.core.BlockHeader import BlockHeader
 from qrl.crypto.misc import merkle_tx_hash
-from qrl.crypto.Qryptonight import Qryptonight
 from qrl.generated import qrl_pb2
 
 
@@ -124,7 +128,12 @@ class Block(object):
                miner_address: bytes,
                seed_height: Optional[int],
                seed_hash: Optional[bytes]):
+        """Assemble a new block.
 
+        Prepend the coinbase (block reward + summed transaction fees) to the given
+        transactions, build the transaction merkle root, and create the matching
+        header with mining nonces zeroed.
+        """
         block = Block()
 
         # Process transactions
@@ -164,6 +173,10 @@ class Block(object):
         return block
 
     def update_mining_address(self, dev_config: DevConfig, mining_address: bytes):
+        """
+        Point the coinbase at a new miner address and recompute the header's
+        merkle root accordingly (used by the miner before submitting a block).
+        """
         coinbase_tx = Transaction.from_pbdata(self.transactions[0])
         coinbase_tx.update_mining_address(mining_address)
         hashedtransactions = []
@@ -176,6 +189,15 @@ class Block(object):
         self._data.header.MergeFrom(self.blockheader.pbdata)
 
     def validate(self, chain_manager, future_blocks: OrderedDict) -> bool:
+        """
+        Fully validate a received block against consensus rules.
+
+        Rejects duplicates and blocks with an unknown parent, checks the
+        parent/child relation and the proof-of-work, requires exactly one
+        coinbase (except the historical block 2078158), then rebuilds the
+        transaction merkle root and fee reward from the block's transactions and
+        confirms the header agrees. Returns True only if every check passes.
+        """
         if chain_manager.get_block_is_duplicate(self):
             logger.warning('Duplicate Block #%s %s', self.block_number, bin2hstr(self.headerhash))
             return False
@@ -236,8 +258,7 @@ class Block(object):
         for index in range(1, len(self.transactions)):
             fee_reward += self.transactions[index].fee
 
-        qn = Qryptonight()
-        seed_block = chain_manager.get_block_by_number(qn.get_seed_height(self.block_number))
+        seed_block = chain_manager.get_seed_block(self.blockheader)
 
         self.blockheader._seed_height = seed_block.block_number
         self.blockheader._seed_hash = seed_block.headerhash
@@ -277,6 +298,10 @@ class Block(object):
 
     @staticmethod
     def get_block_size_limit(state: State, block, dev_config: DevConfig):
+        """
+        Return the allowed block size: the median size of the last 10 blocks,
+        clamped between the configured min and max block-size limits.
+        """
         # NOTE: Miner
         block_size_list = []
         for _ in range(0, 10):
@@ -286,7 +311,9 @@ class Block(object):
             block_size_list.append(block.size)
             if block.block_number == 0:
                 break
-        return max(dev_config.block_min_size_limit_in_bytes, dev_config.size_multiplier * median(block_size_list))
+        return min(dev_config.block_max_size_limit_in_bytes,
+                   max(dev_config.block_min_size_limit_in_bytes,
+                       dev_config.size_multiplier * median(block_size_list)))
 
     @staticmethod
     def remove_blocknumber_mapping(state: State, block_number, batch):

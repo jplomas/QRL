@@ -18,6 +18,10 @@ class CoinBase(Transaction):
         super(CoinBase, self).__init__(protobuf_transaction)
 
     @property
+    def max_size_limit(self):
+        return 133
+
+    @property
     def addr_to(self):
         return self._data.coinbase.addr_to
 
@@ -39,6 +43,7 @@ class CoinBase(Transaction):
         transaction._data.coinbase.addr_to = miner_address
         transaction._data.coinbase.amount = amount
         transaction._data.nonce = block_number + 1
+        # Coinbase stores get_data_hash() directly as its transaction_hash.
         transaction._data.transaction_hash = transaction.get_data_hash()
 
         transaction.validate_or_raise(verify_signature=False)
@@ -60,8 +65,21 @@ class CoinBase(Transaction):
         return self.addr_to
 
     def _validate_custom(self):
+        self._data.fee = 0
+        self._data.public_key = b''
+        self._data.signature = b''
+
+        if not self.validate_size():
+            return False
+
         if self.fee != 0:
             logger.warning('Fee for coinbase transaction should be 0')
+            return False
+
+        if self.txhash != self.get_data_hash():
+            logger.warning('Invalid coinbase transaction hash')
+            logger.warning('Expected %s', bin2hstr(self.get_data_hash()))
+            logger.warning('Found    %s', bin2hstr(self.txhash))
             return False
 
         return True
