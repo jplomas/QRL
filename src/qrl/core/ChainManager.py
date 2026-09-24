@@ -120,11 +120,15 @@ class ChainManager:
         tokens = OrderedDict()
         slave_pks_access_type = OrderedDict()
 
-        max_bitfield_page = ceil((2 ** optimized_address_state.height) / config.dev.ots_tracking_per_page)
         if not exclude_ots_bitfield:
-            ots_bitfield = [b'\x00'] * max(1024, int(ceil((2 ** optimized_address_state.height) / 8)))
+            ots_key_count = 1 << optimized_address_state.height
+            bitfield_bytes = max(config.dev.ots_bitfield_size, (ots_key_count + 7) // 8)
+            if bitfield_bytes > config.dev.max_legacy_ots_bitfield_bytes:
+                raise ValueError('OTS bitfield exceeds legacy API limit; use GetOTS')
+            max_bitfield_page = ceil(ots_key_count / config.dev.ots_tracking_per_page)
+            ots_bitfield = [b'\x00'] * bitfield_bytes
             for page in range(1, max_bitfield_page + 1):
-                offset = (page - 1) * config.dev.ots_tracking_per_page
+                offset = (page - 1) * config.dev.ots_bitfield_size
                 page_data = self.get_bitfield(address, page)
                 for data in page_data:
                     if offset >= len(ots_bitfield):
@@ -373,7 +377,6 @@ class ChainManager:
                 dev_config=dev_config)
 
             mining_blob = blockheader.mining_blob(dev_config)
-            qn = Qryptonight()
             seed_block = self.get_seed_block(blockheader)
             if seed_block is None:
                 if enable_logging:
@@ -400,11 +403,6 @@ class ChainManager:
                                                target):
                 if enable_logging:
                     logger.warning("PoW verification failed")
-                    tmp_hash = qn.hash(blockheader.block_number,
-                                       seed_block.block_number,
-                                       seed_block.headerhash,
-                                       blockheader.mining_blob(dev_config))
-                    logger.warning("{}".format(bin2hstr(tmp_hash)))
                     logger.debug('%s', blockheader.to_json())
                 return False
 
@@ -1335,7 +1333,7 @@ class ChainManager:
 
         return data_point
 
-    def get_unused_ots_index2(self, address, start_ots_index=0):
+    def get_unused_ots_index2(self, address, start_ots_index=0, max_scan_keys=None):
         """
         Convenience wrapper for get_unused_ots_index that reads bitfield pages
         straight from the state DB (no pre-loaded caches).
@@ -1344,14 +1342,16 @@ class ChainManager:
                                          addresses_state=dict(),
                                          address=address,
                                          paginated_bitfield=PaginatedBitfield(False, self._state._db),
-                                         start_ots_index=start_ots_index)
+                                         start_ots_index=start_ots_index,
+                                         max_scan_keys=max_scan_keys)
 
     def get_unused_ots_index(self,
                              addresses_bitfield: dict,
                              addresses_state: dict,
                              address,
                              paginated_bitfield: PaginatedBitfield,
-                             start_ots_index=0):
+                             start_ots_index=0,
+                             max_scan_keys=None):
         """
         Finds the unused ots index above the given start_ots_index.
         """
@@ -1365,7 +1365,8 @@ class ChainManager:
         if address_state.ots_bitfield_used_page == max_page:
             return None
 
-        for curr_ots in range(start_ots_index, ots_key_count):
+        scan_end = ots_key_count if max_scan_keys is None else min(ots_key_count, start_ots_index + max_scan_keys)
+        for curr_ots in range(start_ots_index, scan_end):
             page = (curr_ots // config.dev.ots_tracking_per_page) + 1
             key = paginated_bitfield.generate_bitfield_key(address, page)
             if key not in addresses_bitfield:
@@ -1381,4 +1382,6 @@ class ChainManager:
                         if ots_offset + relative >= start_ots_index:
                             return ots_offset + relative
 
+        if scan_end < ots_key_count:
+            raise ValueError('OTS scan limit reached; retry from index {}'.format(scan_end))
         return None

@@ -1,12 +1,17 @@
 # coding=utf-8
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+import os
+import stat
 from unittest import TestCase
 
+import simplejson as json
 from pyqrllib.pyqrllib import bin2hstr
 
 from qrl.core.Wallet import Wallet, WalletEncryptionError, WalletVersionError, WalletDecryptionError
+from qrl.core import config
 from qrl.core.misc import logger
+from qrl.crypto.AESHelper import AESHelper
 from tests.misc.helper import set_qrl_dir
 
 logger.initialize_default()
@@ -153,6 +158,25 @@ class TestWallet(TestCase):
             xmss0b = wallet.get_xmss_by_address(xmss0.address)
             self.assertEqual('010400d9f1efe5b272e042dcc8ef690f0e90ca8b0b6edba0d26f81e7aff12a6754b21788169f7f',
                              bin2hstr(xmss0b.address))
+
+    def test_existing_wallet_file_is_private_on_load(self):
+        with set_qrl_dir("wallet_ver1"):
+            path = os.path.join(config.user.wallet_dir, config.dev.wallet_dat_filename)
+            os.chmod(config.user.wallet_dir, 0o755)
+            os.chmod(path, 0o644)
+            Wallet()
+            self.assertEqual(stat.S_IMODE(os.stat(config.user.wallet_dir).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_removed_address_does_not_leave_cached_index(self):
+        with set_qrl_dir("no_data"):
+            wallet = Wallet()
+            first = wallet.add_new_address(height=4)
+            second = wallet.add_new_address(height=4)
+            wallet.get_xmss_by_index(0)
+            wallet.get_xmss_by_index(1)
+            self.assertTrue(wallet.remove(first.qaddress))
+            self.assertEqual(wallet.get_xmss_by_index(0).qaddress, second.qaddress)
 
     def test_read_secure(self):
         with set_qrl_dir("wallet_secure_ver1"):
@@ -327,3 +351,68 @@ class TestWallet(TestCase):
             wallet_c.decrypt(TEST_KEY)
             self.assertFalse(wallet_c.address_items[0].encrypted)
             self.assertEqual(wallet.address_items[0], wallet_c.address_items[0])
+
+    def test_encrypted_wallet_rejects_tampered_seed(self):
+        with set_qrl_dir('no_data'):
+            wallet = Wallet()
+            wallet.add_new_address(height=4)
+            wallet.encrypt('passphrase')
+            wallet.save()
+            with open(wallet.wallet_path) as infile:
+                self.assertEqual(2, json.load(infile)['encryption_version'])
+            encrypted = Wallet().address_items[0].hexseed
+            self.assertTrue(encrypted.startswith('qrl-node-v2:'))
+
+            wallet = Wallet()
+            item = wallet.address_items[0]
+            parts = item.hexseed.split(':')
+            parts[-1] = ('0' if parts[-1][0] != '0' else '1') + parts[-1][1:]
+            wallet.address_items[0] = item._replace(hexseed=':'.join(parts))
+            with self.assertRaises(WalletDecryptionError):
+                wallet.decrypt('passphrase')
+
+    def test_versioned_wallet_rejects_legacy_ciphertext_substitution(self):
+        with set_qrl_dir('no_data'):
+            wallet = Wallet()
+            wallet.add_new_address(height=4)
+            plain_seed = wallet.address_items[0].hexseed
+            wallet.encrypt('passphrase')
+            wallet.save()
+
+            reloaded = Wallet()
+            item = reloaded.address_items[0]
+            reloaded.address_items[0] = item._replace(
+                hexseed=AESHelper('passphrase').encrypt(plain_seed.encode()))
+            with self.assertRaises(WalletDecryptionError):
+                reloaded.decrypt('passphrase')
+            with self.assertRaises(WalletEncryptionError):
+                reloaded.save()
+
+    def test_unknown_encryption_version_is_not_treated_as_legacy(self):
+        with set_qrl_dir('no_data'):
+            wallet = Wallet()
+            wallet.add_new_address(height=4)
+            wallet.encrypt('passphrase')
+            wallet.save()
+            with open(wallet.wallet_path) as infile:
+                data = json.load(infile)
+            data['encryption_version'] = 99
+            with open(wallet.wallet_path, 'w') as outfile:
+                json.dump(data, outfile)
+
+            with self.assertRaises(WalletVersionError):
+                Wallet()
+
+    def test_legacy_encrypted_wallet_can_migrate_without_plaintext_save(self):
+        with set_qrl_dir('wallet_secure_ver1'):
+            wallet = Wallet()
+            self.assertFalse(wallet.address_items[0].hexseed.startswith('qrl-node-v2:'))
+            wallet.decrypt('test1234')
+            wallet.encrypt('test1234')
+            wallet.save()
+
+            migrated = Wallet()
+            self.assertTrue(migrated.address_items[0].hexseed.startswith('qrl-node-v2:'))
+            migrated.decrypt('test1234')
+            self.assertEqual(wallet.address_items[0].qaddress,
+                             migrated.address_items[0].qaddress)

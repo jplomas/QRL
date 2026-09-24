@@ -6,10 +6,11 @@ from qrl.core.misc import ntp
 
 
 class OutgoingMessage:
-    def __init__(self, priority, message):
+    def __init__(self, priority, message, wire_bytes):
         self.priority = priority
         self.timestamp = int(ntp.getTime())
         self.message = message
+        self.wire_bytes = wire_bytes
 
     def is_expired(self):
         return ntp.getTime() - self.timestamp > config.user.outgoing_message_expiry

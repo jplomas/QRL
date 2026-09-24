@@ -22,10 +22,12 @@ For instructions on how to install a node, please refer to [Install Node](https:
 
 API documentation can be found at [api.theqrl.org](https://api.theqrl.org)
 
+Wallet daemon API clients must send the per-run token described in [Wallet API authentication](docs/wallet-api-auth.md).
+
 # Building from source
 
 | OS | Guide |
-|---|---|---|
+|---|---|
 | Linux | In progress  🌱 |
 | Mac | [INSTALLING-MAC.md](INSTALLING-MAC.md) ✅ |
 | Win | In progress 🌱 |

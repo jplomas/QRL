@@ -34,7 +34,8 @@ class P2PChainManager(P2PBaseObserver):
             block = source.factory.get_block_by_number(block_number)
             msg = qrllegacy_pb2.LegacyMessage(func_name=qrllegacy_pb2.LegacyMessage.PB,
                                               pbData=qrllegacy_pb2.PBData(block=block.pbdata))
-            source.send(msg)
+            if source.may_serve_response((qrllegacy_pb2.LegacyMessage.FB, block_number), msg.ByteSize() + 4):
+                source.send(msg)
 
     def handle_push_block(self, source, message: qrllegacy_pb2.LegacyMessage):
         """
@@ -80,7 +81,14 @@ class P2PChainManager(P2PBaseObserver):
         if not source.factory.master_mr.isRequested(block.headerhash, source, block):
             return
 
-        source.factory.pow.pre_block_logic(block)  # FIXME: Ignores return value
+        if block.size > config.dev.block_max_size_limit_in_bytes:
+            source.factory.master_mr.remove_hash(block.headerhash, source)
+            return
+
+        if not source.factory.pow.pre_block_logic(block):
+            source.factory.master_mr.remove_hash(block.headerhash, source)
+            return
+
         source.factory.master_mr.register(qrllegacy_pb2.LegacyMessage.BK, block.headerhash, message.block)
 
     def handle_block_height(self, source, message: qrllegacy_pb2.LegacyMessage):

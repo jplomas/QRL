@@ -356,7 +356,7 @@ class P2PFactory(ServerFactory):
         # FIXME: Huge amount of lookups in dictionaries
         msg_hash = mr_data.hash
 
-        if msg_hash in self.master_mr._hash_msg:
+        if self.master_mr.contains(msg_hash, mr_data.type):
             self.master_mr.remove_msg_hash_from_requested_hash(msg_hash)
             return
 
@@ -465,8 +465,8 @@ class P2PFactory(ServerFactory):
         self.register_and_broadcast(qrllegacy_pb2.LegacyMessage.BK, block.headerhash, block.pbdata, data)
 
     def register_and_broadcast(self, msg_type, msg_hash: bytes, pbdata, data=None):
-        self.master_mr.register(msg_type, msg_hash, pbdata)
-        self.broadcast(msg_type, msg_hash, data)
+        if self.master_mr.register(msg_type, msg_hash, pbdata):
+            self.broadcast(msg_type, msg_hash, data)
 
     def broadcast(self, msg_type, msg_hash: bytes, mr_data=None):
         """

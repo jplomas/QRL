@@ -239,6 +239,13 @@ class DevConfig(object):
         self.cache_frequency = 1000
 
         self.message_q_size = 300
+        self.message_cache_max_bytes = 32 * 1024 * 1024
+        self.message_cache_ttl = 600
+        self.max_response_bytes_per_minute = 256 * 1024 * 1024
+        self.max_responses_per_key_per_minute = 2
+        self.max_legacy_ots_bitfield_bytes = 1024 * 1024
+        self.max_get_ots_pages = 32
+        self.max_get_ots_scan_keys = 65536
         self.message_receipt_timeout = 10  # request timeout for full message
         self.message_buffer_size = 16 * 1024 * 1024  # 16 MB
         self.max_peer_list_per_peer = 100
@@ -336,6 +343,11 @@ class DevConfig(object):
         # New Block CONFIG
         # ======================================
         self.block_max_size_limit_in_bytes = 2 * 1024 * 1024  # Max block size
+        self.max_block_message_size = self.block_max_size_limit_in_bytes + 1024
+        self.max_legacy_message_size = 512 * 1024
+        self.max_block_scan_records = 131072
+        self.p2p_parse_workers = 4
+        self.p2p_parse_queue_size = 16
 
     @property
     def pbdata(self):

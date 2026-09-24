@@ -48,6 +48,14 @@ class TestP2PPeerManager(TestCase):
         self.gettime_patcher = patch('qrl.core.misc.ntp.getTime', new=Mock(wraps=replacement_getTime))
         self.mock_getTime = self.gettime_patcher.start()
         self.addCleanup(self.gettime_patcher.stop)
+        self.thread_patcher = patch('qrl.core.p2p.p2pprotocol.reactor.callInThread',
+                                    side_effect=lambda func, *args: func(*args))
+        self.callback_patcher = patch('qrl.core.p2p.p2pprotocol.reactor.callFromThread',
+                                      side_effect=lambda func, *args: func(*args))
+        self.thread_patcher.start()
+        self.callback_patcher.start()
+        self.addCleanup(self.thread_patcher.stop)
+        self.addCleanup(self.callback_patcher.stop)
 
         self.peer_manager = P2PPeerManager()
 
@@ -441,7 +449,7 @@ class TestP2PPeerManager(TestCase):
 
     def test_handle_p2p_acknowledgement(self):
         """
-        Once an acknowledgement is received from a peer, we can update rate counters and send the next message.
+        A peer's acknowledgement must not grant send credit or trigger another write.
         """
         ack = qrllegacy_pb2.LegacyMessage(func_name=qrllegacy_pb2.LegacyMessage.P2P_ACK,
                                           p2pAckData=qrl_pb2.P2PAcknowledgement(bytes_processed=15))
@@ -449,7 +457,8 @@ class TestP2PPeerManager(TestCase):
         channel.bytes_sent = 20
         self.peer_manager.handle_p2p_acknowledgement(channel, ack)
 
-        channel.send_next.assert_called_once_with()
+        self.assertEqual(channel.bytes_sent, 20)
+        channel.send_next.assert_not_called()
 
     def test_handle_p2p_acknowledgement_negative_bytes_processed(self):
         """
@@ -467,6 +476,7 @@ class TestP2PPeerManager(TestCase):
     @patch('qrl.core.p2p.p2pprotocol.P2PProtocol.send')
     def test_trusted_message_count(self, send, get_peer):
         channel = P2PProtocol()
+        channel.transport = Mock()
         with mock.patch('qrl.core.misc.ntp.getTime') as time_mock:
             time_mock.return_value = channel.connected_at + 100
             get_peer.return_value = IPMetadata('192.168.0.1', 1000)
@@ -486,6 +496,7 @@ class TestP2PPeerManager(TestCase):
     @patch('qrl.core.p2p.p2pprotocol.P2PProtocol.send')
     def test_trusted_time(self, send, get_peer):
         channel = P2PProtocol()
+        channel.transport = Mock()
         with mock.patch('qrl.core.misc.ntp.getTime') as time_mock:
             time_mock.return_value = channel.connected_at + 1
             get_peer.return_value = IPMetadata('192.168.0.1', 1000)

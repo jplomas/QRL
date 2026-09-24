@@ -13,6 +13,7 @@ from pyqrllib.pyqrllib import mnemonic2bin, hstr2bin, bin2hstr
 
 from qrl.core import config
 from qrl.core.Wallet import Wallet, WalletDecryptionError
+from qrl.core.wallet_file import write_private_file
 from qrl.core.misc.helper import parse_hexblob, parse_qaddress
 from qrl.core.MultiSigAddressState import MultiSigAddressState
 from qrl.core.txs.MessageTransaction import MessageTransaction
@@ -149,6 +150,9 @@ def _public_get_address_balance(ctx, address):
 def _select_wallet(ctx, address_or_index):
     try:
         wallet = Wallet(wallet_path=ctx.obj.wallet_path)
+        if wallet.encrypted and not wallet.address_items:
+            secret = click.prompt('The wallet is encrypted. Enter password', hide_input=True)
+            wallet.decrypt(secret)
         if not wallet.addresses:
             click.echo('This command requires a local wallet')
             return
@@ -237,6 +241,8 @@ def wallet_ls(ctx):
     Lists available wallets
     """
     wallet = Wallet(wallet_path=ctx.obj.wallet_path)
+    if wallet.encrypted and not wallet.address_items:
+        wallet.decrypt(click.prompt('The wallet is encrypted. Enter password', hide_input=True))
     _print_addresses(ctx, wallet.address_items, ctx.obj.wallet_dir)
 
 
@@ -252,7 +258,7 @@ def wallet_gen(ctx, height, hash_function, encrypt):
     Generates a new wallet with one address
     """
     wallet = Wallet(wallet_path=ctx.obj.wallet_path)
-    if len(wallet.address_items) > 0:
+    if wallet.encrypted or len(wallet.address_items) > 0:
         click.echo("Wallet already exists")
         return
 
@@ -318,6 +324,10 @@ def wallet_recover(ctx, seed_type):
         bin_seed = hstr2bin(seed)
 
     wallet = Wallet(wallet_path=ctx.obj.wallet_path)
+    password = None
+    if wallet.encrypted:
+        password = click.prompt('The wallet is encrypted. Enter password', hide_input=True)
+        wallet.decrypt(password)
 
     recovered_xmss = XMSS.from_extended_seed(bin_seed)
     print('Recovered Wallet Address : %s' % (Wallet._get_Qaddress(recovered_xmss.address),))
@@ -329,6 +339,8 @@ def wallet_recover(ctx, seed_type):
     if click.confirm('Do you want to save the recovered wallet?'):
         click.echo('Saving...')
         wallet.append_xmss(recovered_xmss)
+        if password:
+            wallet.encrypt(password)
         wallet.save()
         click.echo('Done')
         _print_addresses(ctx, wallet.address_items, config.user.wallet_dir)
@@ -368,6 +380,10 @@ def wallet_rm(ctx, wallet_idx, skip_confirmation):
     the wallet_recover command for restoring an address.
     """
     wallet = Wallet(wallet_path=ctx.obj.wallet_path)
+    password = None
+    if wallet.encrypted and not wallet.address_items:
+        password = click.prompt('The wallet is encrypted. Enter password', hide_input=True)
+        wallet.decrypt(password)
 
     address_item = get_item_from_wallet(wallet, wallet_idx)
 
@@ -379,7 +395,11 @@ def wallet_rm(ctx, wallet_idx, skip_confirmation):
                 'Warning! By continuing, you risk complete loss of access to this address if you do not have a '
                 'recovery Mnemonic/Hexseed.')
             click.confirm('Do you want to continue?', abort=True)
-        wallet.remove(address_item.qaddress)
+        wallet.remove(address_item.qaddress, save=password is None)
+        if password is not None:
+            if wallet.address_items:
+                wallet.encrypt(password)
+            wallet.save()
 
         _print_addresses(ctx, wallet.address_items, config.user.wallet_dir)
 
@@ -417,6 +437,26 @@ def wallet_decrypt(ctx):
     except Exception as e:
         click.echo(str(e))
         quit(1)
+
+
+@qrl.command(name='wallet_upgrade_encryption')
+@click.pass_context
+def wallet_upgrade_encryption(ctx):
+    wallet = Wallet(wallet_path=ctx.obj.wallet_path)
+    if not wallet.encrypted:
+        raise click.ClickException('Wallet is not encrypted')
+    if wallet._encryption_version == 2:
+        click.echo('Wallet encryption is current')
+        return
+
+    secret = click.prompt('Enter password', hide_input=True)
+    try:
+        wallet.decrypt(secret)
+        wallet.encrypt(secret)
+        wallet.save()
+    except Exception as error:
+        raise click.ClickException('Wallet encryption upgrade failed: {}'.format(error)) from error
+    click.echo('Wallet encryption upgraded')
 
 
 @qrl.command(name='tx_inspect')
@@ -979,8 +1019,8 @@ def slave_tx_generate(ctx, src, master, number_of_slaves, access_type, fee, pk, 
                                      xmss_pk=address_src_pk,
                                      master_addr=master_addr)
         tx.sign(src_xmss)
-        with open('slaves.json', 'w') as f:
-            json.dump([bin2hstr(src_xmss.address), slave_xmss_seed, tx.to_json()], f)
+        slave_data = [bin2hstr(src_xmss.address), slave_xmss_seed, tx.to_json()]
+        write_private_file('slaves.json', json.dumps(slave_data).encode('ascii'))
         click.echo('Successfully created slaves.json')
         click.echo('Move slaves.json file from current directory to the mining node inside ~/.qrl/')
     except Exception as e:

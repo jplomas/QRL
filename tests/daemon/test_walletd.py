@@ -1,17 +1,24 @@
 # coding=utf-8
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+import os
+import stat
+from threading import Event, Thread
 from unittest import TestCase
 
-from mock import Mock
+import simplejson as json
+from mock import Mock, patch
 from pyqrllib.pyqrllib import bin2hstr, hstr2bin
 
-from qrl.daemon.walletd import WalletD
+from qrl.daemon.walletd import WalletD, run
+from qrl.core import config
 from qrl.generated import qrl_pb2
 from qrl.core.AddressState import AddressState
 from qrl.core.txs.TransferTransaction import TransferTransaction
 from qrl.core.txs.MessageTransaction import MessageTransaction
 from qrl.daemon.helper.DaemonHelper import WalletDecryptionError
+from qrl.daemon.helper.DaemonHelper import Wallet as DaemonWallet
+from qrl.crypto.AESHelper import AESHelper
 from qrl.core.misc import logger
 from tests.misc.helper import set_qrl_dir, get_alice_xmss, get_bob_xmss
 from tests.misc.MockHelper.mock_function import MockFunction
@@ -32,10 +39,47 @@ class TestWalletD(TestCase):
                         "jaguar span rinse salty pulsar violet fare"
         super(TestWalletD, self).__init__(*args, **kwargs)
 
+    @staticmethod
+    def stub_get_ots(walletd, next_index=0):
+        walletd._public_stub.GetOTS = Mock(
+            return_value=qrl_pb2.GetOTSResp(next_unused_ots_index=next_index,
+                                            unused_ots_index_found=True))
+
     def test_init(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
             self.assertIsNotNone(walletd)
+
+    def test_run_writes_private_api_token_and_uses_interceptor(self):
+        with set_qrl_dir("wallet_ver1"), \
+                patch('qrl.daemon.walletd.logger'), \
+                patch('qrl.daemon.walletd.grpc.server') as server_factory, \
+                patch('qrl.daemon.walletd.add_WalletAPIServicer_to_server'), \
+                patch('qrl.daemon.walletd.sleep', side_effect=RuntimeError('stop test server')):
+            server_factory.return_value.add_insecure_port.return_value = 19010
+            run()
+
+            token_path = os.path.join(config.user.wallet_dir, 'wallet_api.token')
+            with open(token_path, 'r') as token_file:
+                token = token_file.read()
+            self.assertGreaterEqual(len(token), 32)
+            self.assertEqual(stat.S_IMODE(os.stat(token_path).st_mode), 0o600)
+            interceptor = server_factory.call_args.kwargs['interceptors'][0]
+            self.assertEqual(interceptor._token, token)
+            server_factory.return_value.start.assert_called_once_with()
+            server_factory.return_value.stop.assert_called_once_with(0)
+
+    def test_run_rejects_non_loopback_wallet_api(self):
+        with set_qrl_dir("wallet_ver1"), \
+                patch.object(config.user, 'wallet_api_host', '0.0.0.0'), \
+                patch('qrl.daemon.walletd.logger'), \
+                patch('qrl.daemon.walletd.grpc.server') as server_factory, \
+                patch('qrl.daemon.walletd.add_WalletAPIServicer_to_server'), \
+                patch('qrl.daemon.walletd.sleep', side_effect=RuntimeError('stop test server')):
+            server_factory.return_value.add_insecure_port.return_value = 19010
+            with self.assertRaisesRegex(ValueError, 'loopback'):
+                run()
+            server_factory.assert_not_called()
 
     def test_qaddress_to_address(self):
         with set_qrl_dir("wallet_ver1"):
@@ -119,6 +163,14 @@ class TestWalletD(TestCase):
             walletd = WalletD()
             m = MockFunction()
             walletd.get_address_state = m.get
+
+            def get_ots(request):
+                state = m.get('Q' + bin2hstr(request.address))
+                next_index = state.get_unused_ots_index(request.unused_ots_index_from)
+                return qrl_pb2.GetOTSResp(next_unused_ots_index=next_index or 0,
+                                          unused_ots_index_found=next_index is not None)
+
+            walletd._public_stub.GetOTS = Mock(side_effect=get_ots)
 
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
@@ -511,6 +563,7 @@ class TestWalletD(TestCase):
     def test_relay_transfer_txn_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
 
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
@@ -537,6 +590,7 @@ class TestWalletD(TestCase):
     def test_relay_transfer_txn2_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
 
@@ -629,6 +683,7 @@ class TestWalletD(TestCase):
     def test_relay_message_txn_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
 
@@ -681,6 +736,7 @@ class TestWalletD(TestCase):
     def test_relay_message_txn2_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
 
@@ -741,6 +797,7 @@ class TestWalletD(TestCase):
     def test_relay_token_txn_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
             qaddress = walletd.add_new_address_with_slaves(height=8)
@@ -817,6 +874,7 @@ class TestWalletD(TestCase):
     def test_relay_token_txn2_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
 
@@ -953,6 +1011,7 @@ class TestWalletD(TestCase):
     def test_relay_transfer_token_txn_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
 
@@ -1031,6 +1090,7 @@ class TestWalletD(TestCase):
     def test_relay_slave_txn_by_slave(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
+            self.stub_get_ots(walletd)
             walletd._public_stub.PushTransaction = Mock(
                 return_value=qrl_pb2.PushTransactionResp(error_code=qrl_pb2.PushTransactionResp.SUBMITTED))
 
@@ -1077,6 +1137,150 @@ class TestWalletD(TestCase):
             with self.assertRaises(Exception):
                 walletd.encrypt_wallet(passphrase=self.passphrase)
 
+    def test_nested_slave_seeds_use_authenticated_encryption(self):
+        with set_qrl_dir('no_data'):
+            wallet = DaemonWallet(os.path.join(config.user.wallet_dir, 'walletd.json'))
+            master = get_alice_xmss(6)
+            slave = get_bob_xmss(6)
+            wallet.append_xmss(master)
+            wallet.append_slave([slave], None)
+            wallet.encrypt(self.passphrase)
+            wallet.save()
+
+            reloaded = DaemonWallet(wallet.wallet_path)
+            nested = reloaded.address_items[0].slaves[0][0]
+            self.assertTrue(nested.hexseed.startswith('qrl-node-v2:'))
+            self.assertEqual(slave.hexseed,
+                             reloaded.decrypt_address_item(nested, self.passphrase).hexseed)
+            reloaded.decrypt(self.passphrase)
+            self.assertEqual(slave.hexseed, reloaded.address_items[0].slaves[0][0].hexseed)
+
+    def test_legacy_encrypted_wallet_migrates_on_unlock(self):
+        with set_qrl_dir('no_data'):
+            path = os.path.join(config.user.wallet_dir, 'walletd.json')
+            wallet = DaemonWallet(path)
+            wallet.append_xmss(get_alice_xmss(6))
+            item = wallet.address_items[0]
+            legacy = AESHelper(self.passphrase)
+            wallet._address_items[0] = item._replace(
+                hexseed=legacy.encrypt(item.hexseed.encode()),
+                mnemonic=legacy.encrypt(item.mnemonic.encode()),
+                encrypted=True)
+            wallet.save()
+
+            daemon = WalletD()
+            daemon.unlock_wallet(self.passphrase)
+            migrated = DaemonWallet(path)
+            self.assertTrue(migrated.address_items[0].hexseed.startswith('qrl-node-v2:'))
+            migrated.decrypt(self.passphrase)
+            self.assertEqual(item.hexseed, migrated.address_items[0].hexseed)
+
+    def test_version_zero_daemon_wallet_migrates_on_unlock(self):
+        with set_qrl_dir('no_data'):
+            path = os.path.join(config.user.wallet_dir, 'walletd.json')
+            wallet = DaemonWallet(path)
+            wallet.append_xmss(get_alice_xmss(6))
+            item = wallet.address_items[0]
+            legacy = AESHelper(self.passphrase)
+            data = item._asdict()
+            data['address'] = legacy.encrypt(data.pop('qaddress').encode())
+            data['hexseed'] = legacy.encrypt(data['hexseed'].encode())
+            data['mnemonic'] = legacy.encrypt(data['mnemonic'].encode())
+            data['encrypted'] = True
+            with open(path, 'w') as outfile:
+                json.dump([data], outfile)
+
+            daemon = WalletD()
+            daemon.unlock_wallet(self.passphrase)
+            upgraded = DaemonWallet(path)
+            self.assertEqual(1, upgraded.version)
+            self.assertEqual(2, upgraded._encryption_version)
+            upgraded.decrypt(self.passphrase)
+            self.assertEqual(item.hexseed, upgraded.address_items[0].hexseed)
+
+    def test_concurrent_encryption_does_not_lose_acknowledged_address(self):
+        with set_qrl_dir('no_data'):
+            daemon = WalletD()
+            daemon.add_new_address(height=6)
+            copied = Event()
+            resume = Event()
+            added = []
+            errors = []
+            original_copy = daemon._copy_wallet
+
+            def delayed_copy():
+                snapshot = original_copy()
+                copied.set()
+                if not resume.wait(5):
+                    raise RuntimeError('test timed out')
+                return snapshot
+
+            def encrypt():
+                try:
+                    daemon.encrypt_wallet(self.passphrase)
+                except Exception as error:
+                    errors.append(error)
+
+            def add():
+                try:
+                    added.append(daemon.add_new_address(height=6))
+                except ValueError:
+                    pass  # Encryption may win; the add must then fail explicitly.
+                except Exception as error:
+                    errors.append(error)
+
+            with patch.object(daemon, '_copy_wallet', side_effect=delayed_copy):
+                encrypt_thread = Thread(target=encrypt)
+                encrypt_thread.start()
+                self.assertTrue(copied.wait(5))
+                add_thread = Thread(target=add)
+                add_thread.start()
+                add_thread.join(timeout=1)
+                resume.set()
+                encrypt_thread.join(timeout=10)
+                add_thread.join(timeout=10)
+
+            self.assertFalse(encrypt_thread.is_alive() or add_thread.is_alive())
+            self.assertEqual([], errors)
+            saved_addresses = {item.qaddress for item in DaemonWallet(daemon._wallet_path).address_items}
+            self.assertTrue(set(added).issubset(saved_addresses))
+
+    def test_legacy_migration_write_failure_keeps_old_wallet_locked(self):
+        with set_qrl_dir('no_data'):
+            path = os.path.join(config.user.wallet_dir, 'walletd.json')
+            wallet = DaemonWallet(path)
+            wallet.append_xmss(get_alice_xmss(6))
+            item = wallet.address_items[0]
+            legacy = AESHelper(self.passphrase)
+            wallet._address_items[0] = item._replace(
+                hexseed=legacy.encrypt(item.hexseed.encode()),
+                mnemonic=legacy.encrypt(item.mnemonic.encode()),
+                encrypted=True)
+            wallet.save()
+
+            daemon = WalletD()
+            with patch('qrl.core.wallet_file.os.replace', side_effect=OSError('write failed')):
+                with self.assertRaises(OSError):
+                    daemon.unlock_wallet(self.passphrase)
+            self.assertIsNone(daemon._passphrase)
+            self.assertFalse(DaemonWallet(path).address_items[0].hexseed.startswith('qrl-node-v2:'))
+
+    def test_nested_slave_ciphertext_swap_fails_unlock(self):
+        with set_qrl_dir('no_data'):
+            path = os.path.join(config.user.wallet_dir, 'walletd.json')
+            wallet = DaemonWallet(path)
+            wallet.append_xmss(get_alice_xmss(6))
+            wallet.append_slave([get_bob_xmss(6)], None)
+            wallet.encrypt(self.passphrase)
+            wallet.save()
+
+            reloaded = DaemonWallet(path)
+            master = reloaded.address_items[0]
+            slave = master.slaves[0][0]
+            master.slaves[0][0] = slave._replace(hexseed=master.hexseed)
+            with self.assertRaises(WalletDecryptionError):
+                reloaded.decrypt(self.passphrase)
+
     def test_lock_wallet(self):
         with set_qrl_dir("wallet_ver1"):
             walletd = WalletD()
@@ -1104,6 +1308,122 @@ class TestWalletD(TestCase):
             walletd.unlock_wallet(passphrase=self.passphrase)
             walletd.add_new_address()
             self.assertEqual(len(walletd.list_address()), 2)
+
+    def test_failed_unlock_cannot_remove_address(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            qaddress = walletd.add_new_address(height=6)
+            walletd.encrypt_wallet(self.passphrase)
+            walletd.lock_wallet()
+
+            with self.assertRaises(WalletDecryptionError):
+                walletd.unlock_wallet('wrong-password')
+            self.assertIsNone(walletd._passphrase)
+            with self.assertRaises(ValueError):
+                walletd.remove_address(qaddress)
+            self.assertEqual(walletd._wallet.__class__(walletd._wallet_path).address_items[0].qaddress, qaddress)
+
+    def test_wallet_directory_and_file_are_private(self):
+        with set_qrl_dir("wallet_ver1"):
+            os.chmod(config.user.wallet_dir, 0o755)
+            walletd = WalletD()
+            walletd.add_new_address(height=6)
+            self.assertEqual(stat.S_IMODE(os.stat(config.user.wallet_dir).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(walletd._wallet_path).st_mode), 0o600)
+
+    def test_failed_password_change_leaves_wallet_locked(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            qaddress = walletd.add_new_address(height=6)
+            walletd.encrypt_wallet(self.passphrase)
+            walletd.lock_wallet()
+
+            with self.assertRaises(ValueError):
+                walletd.change_passphrase('wrong-password', 'new-password')
+            self.assertIsNone(walletd._passphrase)
+            with self.assertRaises(ValueError):
+                walletd.remove_address(qaddress)
+            walletd.unlock_wallet(self.passphrase)
+            self.assertEqual(walletd.list_address(), [qaddress])
+
+    def test_failed_unlock_revokes_prior_unlock(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            walletd.add_new_address(height=6)
+            walletd.encrypt_wallet(self.passphrase)
+            walletd.unlock_wallet(self.passphrase)
+            with self.assertRaises(WalletDecryptionError):
+                walletd.unlock_wallet('wrong-password')
+            self.assertIsNone(walletd._passphrase)
+            with self.assertRaises(ValueError):
+                walletd.list_address()
+
+    def test_failed_wallet_reload_revokes_prior_unlock(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            walletd._passphrase = self.passphrase
+            with patch('qrl.daemon.walletd.Wallet', side_effect=OSError('load failed')):
+                with self.assertRaises(OSError):
+                    walletd.load_wallet()
+            self.assertIsNone(walletd._passphrase)
+
+    def test_password_change_write_failure_keeps_old_wallet(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            qaddress = walletd.add_new_address(height=6)
+            walletd.encrypt_wallet(self.passphrase)
+            with patch('qrl.core.wallet_file.os.replace', side_effect=OSError('write failed')):
+                with self.assertRaises(OSError):
+                    walletd.change_passphrase(self.passphrase, 'new-password')
+            self.assertIsNone(walletd._passphrase)
+            self.assertFalse(any(name.startswith('.qrl-wallet-')
+                                 for name in os.listdir(config.user.wallet_dir)))
+            walletd.unlock_wallet(self.passphrase)
+            self.assertEqual(walletd.list_address(), [qaddress])
+
+    def test_encryption_write_failure_keeps_plain_wallet(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            qaddress = walletd.add_new_address(height=6)
+            with patch('qrl.core.wallet_file.os.replace', side_effect=OSError('write failed')):
+                with self.assertRaises(OSError):
+                    walletd.encrypt_wallet(self.passphrase)
+            self.assertIsNone(walletd._passphrase)
+            self.assertFalse(walletd._wallet.is_encrypted())
+            reloaded = walletd._wallet.__class__(walletd._wallet_path)
+            self.assertFalse(reloaded.is_encrypted())
+            self.assertEqual(reloaded.address_items[0].qaddress, qaddress)
+
+    def test_rotated_password_cannot_use_warmed_xmss(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            qaddress = walletd.add_new_address(height=6)
+            walletd.encrypt_wallet(self.passphrase)
+            walletd.unlock_wallet(self.passphrase)
+            seeds = walletd.get_recovery_seeds(qaddress)
+            walletd.change_passphrase(self.passphrase, 'new-password')
+
+            with self.assertRaises(WalletDecryptionError):
+                walletd.unlock_wallet(self.passphrase)
+            self.assertIsNone(walletd._passphrase)
+            with self.assertRaises(ValueError):
+                walletd.get_recovery_seeds(qaddress)
+            walletd.unlock_wallet('new-password')
+            self.assertEqual(walletd.get_recovery_seeds(qaddress), seeds)
+
+    def test_address_removal_does_not_reuse_cached_index(self):
+        with set_qrl_dir("wallet_ver1"):
+            walletd = WalletD()
+            first = walletd.add_new_address(height=6)
+            second = walletd.add_new_address(height=6)
+            walletd.encrypt_wallet(self.passphrase)
+            walletd.unlock_wallet(self.passphrase)
+            first_seeds = walletd.get_recovery_seeds(first)
+            second_seeds = walletd.get_recovery_seeds(second)
+
+            self.assertTrue(walletd.remove_address(first))
+            self.assertNotEqual(first_seeds, second_seeds)
+            self.assertEqual(walletd.get_recovery_seeds(second), second_seeds)
 
     def test_change_passphrase(self):
         with set_qrl_dir("wallet_ver1"):

@@ -89,7 +89,8 @@ class P2PTxManagement(P2PBaseObserver):
         :return:
         """
         msg = source.factory.master_mr.get(message.mrData.type, message.mrData.hash)
-        if msg is not None:
+        if msg is not None and source.may_serve_response((message.mrData.type, message.mrData.hash),
+                                                          msg.ByteSize() + 4):
             source.send(msg)
 
     ###################################################

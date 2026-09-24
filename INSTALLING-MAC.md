@@ -41,8 +41,8 @@ If you encounter issues, force a complete rebuild:
 > ImportError: symbol not found in flat namespace '__ZTIN7leveldb10ComparatorE'
 > ```
 > 
-> The solution is to rebuild LevelDB from source with RTTI enabled. The `
-> install_leveldb.sh` script automates this, but you can do it manually if needed.
+> The solution is to rebuild LevelDB from source with RTTI enabled. The
+> `install_leveldb.sh` script automates this, but you can do it manually if needed.
 
 ### Step 3: Install build dependencies from Homebrew
 

@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from qrl.cli import qrl as qrl_cli
 from qrl.core import config
 from qrl.core.misc import logger
+from qrl.crypto.AESHelper import AESHelper
 from qrl.generated import qrl_pb2
 
 logger.initialize_default()
@@ -210,6 +211,28 @@ class TestCLI(TestCase):
         self.assertEqual(1, result.exit_code)
         # TODO: Add appropriate error matching
 
+    def test_wallet_upgrade_encryption_migrates_legacy_file(self):
+        wallet = open_wallet()
+        record = wallet['addresses'][0]
+        legacy = AESHelper('password')
+        record['hexseed'] = legacy.encrypt(record['hexseed'].encode())
+        record['mnemonic'] = legacy.encrypt(record['mnemonic'].encode())
+        wallet['encrypted'] = True
+        with open('wallet.json', 'w') as outfile:
+            json.dump(wallet, outfile)
+
+        result = self.runner.invoke(qrl_cli, ['wallet_upgrade_encryption'], input='wrong\n')
+        self.assertNotEqual(0, result.exit_code)
+        self.assertNotIn('encryption_version', open_wallet())
+
+        result = self.runner.invoke(qrl_cli, ['wallet_upgrade_encryption'], input='password\n')
+        self.assertEqual(0, result.exit_code)
+        upgraded = open_wallet()
+        self.assertEqual(2, upgraded['encryption_version'])
+        self.assertTrue(upgraded['addresses'][0]['hexseed'].startswith('qrl-node-v2:'))
+        result = self.runner.invoke(qrl_cli, ['wallet_secret', '--wallet-idx=0'], input='password\n')
+        self.assertEqual(0, result.exit_code)
+
     def test_wallet_secret_invalid_input(self):
         result = self.runner.invoke(qrl_cli, ["wallet_secret", "--wallet-idx=2"])
         self.assertEqual(result.output.strip(), 'Wallet index not found 2')
@@ -291,23 +314,36 @@ class TestCLI(TestCase):
         master_address = wallet["addresses"][0]["address"]
 
         # Simplest use case
-        result = self.runner.invoke(qrl_cli, [
-            "slave_tx_generate", "--src=0", "--master={}".format(master_address),
-            "--number_of_slaves=1", "--access_type=0", "--fee=0"
-        ])
+        previous_umask = os.umask(0o022)
+        try:
+            result = self.runner.invoke(qrl_cli, [
+                "slave_tx_generate", "--src=0", "--master={}".format(master_address),
+                "--number_of_slaves=1", "--access_type=0", "--fee=0"
+            ])
+        finally:
+            os.umask(previous_umask)
         print(result.output)
         print(result.exc_info)
         self.assertEqual(result.exit_code, 0)
         self.assertTrue(os.path.exists('slaves.json'))
+        self.assertEqual(0o600, os.stat('slaves.json').st_mode & 0o777)
+        with open('slaves.json') as infile:
+            slave_data = json.load(infile)
+        self.assertEqual(3, len(slave_data))
+        self.assertEqual(master_address[1:], slave_data[0])
+        self.assertEqual(1, len(slave_data[1]))
 
-        # Does it work with 5 slaves?
-        os.remove('slaves.json')
+        # Replacing a previously permissive file must restrict it too.
+        os.chmod('slaves.json', 0o644)
         result = self.runner.invoke(qrl_cli, [
             "slave_tx_generate", "--src=0", "--master={}".format(master_address),
             "--number_of_slaves=5", "--access_type=0", "--fee=0"
         ])
         self.assertEqual(result.exit_code, 0)
         self.assertTrue(os.path.exists('slaves.json'))
+        self.assertEqual(0o600, os.stat('slaves.json').st_mode & 0o777)
+        with open('slaves.json') as infile:
+            self.assertEqual(5, len(json.load(infile)[1]))
 
         # access_type could be 0 or 1. test 1.
         os.remove('slaves.json')

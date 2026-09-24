@@ -6,6 +6,7 @@ from unittest import TestCase
 from mock import Mock, patch
 from pyqryptonight.pyqryptonight import StringToUInt256
 
+from qrl.core import config
 from qrl.core.misc import logger
 from qrl.core.Block import Block
 from qrl.core.messagereceipt import MessageReceipt
@@ -46,6 +47,11 @@ class TestP2PChainManager(TestCase):
         self.manager.handle_fetch_block(self.channel, msg)
 
         self.channel.send.assert_called()
+
+        self.channel.send.reset_mock()
+        self.channel.may_serve_response.return_value = False
+        self.manager.handle_fetch_block(self.channel, msg)
+        self.channel.send.assert_not_called()
 
     def test_handle_fetch_block_bad_height(self, m_logger):
         """
@@ -111,6 +117,30 @@ class TestP2PChainManager(TestCase):
 
         self.manager.handle_block(self.channel, msg)
         self.channel.factory.master_mr.register.assert_not_called()
+
+    def test_handle_block_does_not_cache_rejected_block(self, m_logger):
+        msg = make_message(func_name=qrllegacy_pb2.LegacyMessage.BK,
+                           block=qrl_pb2.Block())
+        self.channel.factory.master_mr.isRequested.return_value = True
+        self.channel.factory.pow.pre_block_logic.return_value = False
+
+        self.manager.handle_block(self.channel, msg)
+
+        self.channel.factory.master_mr.register.assert_not_called()
+        self.channel.factory.master_mr.remove_hash.assert_called_once_with(b'', self.channel)
+
+    def test_handle_block_does_not_process_oversized_block(self, m_logger):
+        block = qrl_pb2.Block()
+        block.header.block_number = 1
+        msg = make_message(func_name=qrllegacy_pb2.LegacyMessage.BK, block=block)
+        self.channel.factory.master_mr.isRequested.return_value = True
+
+        with patch.object(config.dev, 'block_max_size_limit_in_bytes', 1):
+            self.manager.handle_block(self.channel, msg)
+
+        self.channel.factory.pow.pre_block_logic.assert_not_called()
+        self.channel.factory.master_mr.register.assert_not_called()
+        self.channel.factory.master_mr.remove_hash.assert_called_once_with(b'', self.channel)
 
     @patch('qrl.core.p2p.p2pChainManager.Block')
     def test_handle_block_bad_block(self, m_Block, m_logger):

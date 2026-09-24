@@ -3,13 +3,13 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 from collections import OrderedDict
+from time import monotonic
 
 from typing import Optional
 
 from qrl.core import config
 from qrl.core.Message import Message
 from qrl.core.RequestedHash import RequestedHash
-from qrl.core.txs.CoinBase import CoinBase
 from qrl.generated import qrllegacy_pb2
 from qrl.generated.qrllegacy_pb2 import LegacyMessage
 
@@ -92,12 +92,15 @@ class MessageReceipt(object):
 
     def __init__(self):
         self._hash_msg = OrderedDict()
+        self._hash_msg_sizes = {}
+        self._hash_msg_times = {}
+        self._cache_bytes = 0
         self._requested_hash = RequestedHash()
 
     def register(self, msg_type, msg_hash: bytes, pbdata):
         """
         Registers an object and type on with msg_hash as key
-        There is a limitation on the amount of items (config.dev.message_q_size)
+        The cache is limited by item count and serialized payload bytes.
         Containers operate in a FIFO fashion.
         :param msg_hash:
         :param pbdata:
@@ -105,12 +108,37 @@ class MessageReceipt(object):
         """
         # FIXME: Hash is converted to string
         # FIXME: No check on the validity of the message type
-        if len(self._hash_msg) >= config.dev.message_q_size:
-            self.__remove__(self._hash_msg)
+        size = pbdata.ByteSize()
+        max_entry_bytes = (config.dev.block_max_size_limit_in_bytes
+                           if msg_type == LegacyMessage.BK else config.dev.max_bytes_out)
+        if (size > max_entry_bytes or size > config.dev.message_cache_max_bytes or
+                config.dev.message_q_size <= 0):
+            return False
+
+        self._evict_expired()
+        if msg_hash in self._hash_msg:
+            self.deregister(msg_hash, msg_type)
+
+        while self._hash_msg and (len(self._hash_msg) >= config.dev.message_q_size or
+                                  self._cache_bytes + size > config.dev.message_cache_max_bytes):
+            oldest_hash, _ = self._hash_msg.popitem(last=False)
+            self._cache_bytes -= self._hash_msg_sizes.pop(oldest_hash)
+            del self._hash_msg_times[oldest_hash]
 
         message = Message(pbdata, msg_type)
-
         self._hash_msg[msg_hash] = message
+        self._hash_msg_sizes[msg_hash] = size
+        self._hash_msg_times[msg_hash] = monotonic()
+        self._cache_bytes += size
+        return True
+
+    def _evict_expired(self):
+        now = monotonic()
+        while self._hash_msg:
+            oldest_hash = next(iter(self._hash_msg))
+            if now - self._hash_msg_times[oldest_hash] < config.dev.message_cache_ttl:
+                break
+            self.deregister(oldest_hash, self._hash_msg[oldest_hash].msg_type)
 
     def get(self, msg_type, msg_hash: bytes) -> Optional[qrllegacy_pb2.LegacyMessage]:
         if not self.contains(msg_hash, msg_type):
@@ -139,44 +167,38 @@ class MessageReceipt(object):
 
     def isRequested(self, msg_hash: bytes, peer, block=None):
         message_request = self._requested_hash.get_msg_request(msg_hash)
-        if message_request:
-            if peer in message_request.peers_connection_list:
-                return True
-
-        if block:
-            if self.block_params(msg_hash, block):
+        if message_request and peer in message_request.peers_connection_list:
+            if block is None or self.block_params(msg_hash, block, peer):
                 return True
 
         self.remove_hash(msg_hash, peer)
         return False
 
-    def block_params(self, msg_hash: bytes, block):
+    def block_params(self, msg_hash: bytes, block, peer):
         message_receipt = self._requested_hash.get_msg_request(msg_hash)
         if message_receipt is None:
             return False
 
-        params = message_receipt.params
-        coinbase_tx = CoinBase.from_pbdata(block.transactions[0])
-        if coinbase_tx.addr_from != params.stake_selector:
+        params = message_receipt.params_by_peer.get(peer)
+        if params is None or params.type != LegacyMessage.BK or params.hash != msg_hash:
             return False
 
-        if block.block_number != params.block_number:
+        if block.headerhash != msg_hash or not block.transactions:
             return False
 
-        if block.prev_headerhash != params.prev_headerhash:
+        coinbase = block.transactions[0]
+        if coinbase.WhichOneof('transactionType') != 'coinbase':
             return False
 
-        if block.reveal_hash != params.reveal_hash:
-            return False
-
-        return True
+        return (coinbase.public_key == params.stake_selector and
+                block.block_number == params.block_number and
+                block.prev_headerhash == params.prev_headerhash)
 
     def deregister(self, msg_hash: bytes, msg_type):
         if msg_hash in self._hash_msg:
             del self._hash_msg[msg_hash]
-
-    def __remove__(self, myObj):
-        myObj.popitem(last=False)
+            self._cache_bytes -= self._hash_msg_sizes.pop(msg_hash)
+            del self._hash_msg_times[msg_hash]
 
     def remove_hash(self, msg_hash: bytes, peer):
         self._requested_hash.remove_peer_from_msg_hash(msg_hash, peer)
@@ -190,6 +212,8 @@ class MessageReceipt(object):
         :param msg_type: The type of msg to match
         :return: True is the msg_obj is known and matches the msg_type
         """
+        if msg_hash in self._hash_msg and monotonic() - self._hash_msg_times[msg_hash] >= config.dev.message_cache_ttl:
+            self.deregister(msg_hash, msg_type)
         if msg_hash in self._hash_msg:
             message = self._hash_msg[msg_hash]
             if message.msg_type == msg_type:

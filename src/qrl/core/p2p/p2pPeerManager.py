@@ -364,16 +364,12 @@ class P2PPeerManager(P2PBaseObserver):
     def handle_p2p_acknowledgement(self, source, message: qrllegacy_pb2.LegacyMessage):
         P2PBaseObserver._validate_message(message, qrllegacy_pb2.LegacyMessage.P2P_ACK)
 
-        source.bytes_sent -= message.p2pAckData.bytes_processed
-        if source.bytes_sent < 0:
+        if message.p2pAckData.bytes_processed > source.bytes_sent:
             logger.warning('Disconnecting Peer %s', source.peer)
-            logger.warning('Reason: negative bytes_sent value')
+            logger.warning('Reason: ACK exceeds bytes sent')
             logger.warning('bytes_sent %s', source.bytes_sent)
             logger.warning('Ack bytes_processed %s', message.p2pAckData.bytes_processed)
             source.loseConnection()
-            return
-
-        source.send_next()
 
     ####################################################
     ####################################################

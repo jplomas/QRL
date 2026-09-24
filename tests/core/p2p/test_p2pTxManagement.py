@@ -266,8 +266,9 @@ class TestP2PTxManagementHandlers(TestCase):
 
         self.channel.factory.request_full_message.assert_not_called()
 
+    @patch('qrl.core.p2p.p2pTxManagement.ntp.getTime', return_value=1)
     @patch('qrl.core.p2p.p2pTxManagement.logger')
-    def test_handle_message_received_transactions_ignored_while_mempool_full(self, mock_logger):
+    def test_handle_message_received_transactions_ignored_while_mempool_full(self, mock_logger, mock_time):
         self.channel.factory.sync_state.state = ESyncState.synced
         self.channel.factory.master_mr.contains.return_value = False  # No, we do not already have this Message.
         self.channel.factory.master_mr.is_callLater_active.return_value = False  # No, we haven't requested this Message yet.
@@ -351,8 +352,16 @@ class TestP2PTxManagementHandlers(TestCase):
         # We do have the Message the peer requested.
         mrData = qrllegacy_pb2.MRData(type=qrllegacy_pb2.LegacyMessage.SL)
         msg = make_message(func_name=qrllegacy_pb2.LegacyMessage.MR, mrData=mrData)
+        self.channel.factory.master_mr.get.return_value = qrllegacy_pb2.LegacyMessage(
+            func_name=qrllegacy_pb2.LegacyMessage.SL,
+            slData=qrl_pb2.Transaction(public_key=b'key'))
         P2PTxManagement.handle_full_message_request(self.channel, msg)
         self.channel.send.assert_called()
+
+        self.channel.send.reset_mock()
+        self.channel.may_serve_response.return_value = False
+        P2PTxManagement.handle_full_message_request(self.channel, msg)
+        self.channel.send.assert_not_called()
 
         # We don't have the Message the peer requested.
         self.channel.send.reset_mock()

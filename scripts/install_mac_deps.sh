@@ -63,6 +63,9 @@ fix_gcc_include_fixed() {
 
     # Find all GCC installations in Homebrew
     local gcc_cellar_base="/usr/local/Cellar"
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        gcc_cellar_base="/opt/homebrew/Cellar"
+    fi
     if [[ ! -d "$gcc_cellar_base" ]]; then
         print_info "  Homebrew Cellar not found at $gcc_cellar_base, skipping GCC check"
         return 0

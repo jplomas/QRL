@@ -2,10 +2,15 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
+from threading import RLock
 
 import argparse
+import copy
+import ipaddress
 import os
 import logging
+import secrets
 import grpc
 from typing import Optional
 from time import sleep
@@ -14,10 +19,12 @@ from daemonize import Daemonize
 from pyqrllib.pyqrllib import hstr2bin, mnemonic2bin, bin2hstr, QRLHelper
 
 from qrl.core import config
+from qrl.core.wallet_file import ensure_private_dir, write_private_file
 from qrl.core.AddressState import AddressState
 from qrl.daemon.helper import logger
 from qrl.daemon.helper.DaemonHelper import WalletDecryptionError, Wallet, UNRESERVED_OTS_INDEX_START
 from qrl.services.WalletAPIService import WalletAPIService
+from qrl.services.wallet_auth import WalletAuthInterceptor
 from qrl.generated import qrl_pb2, qrl_pb2_grpc, qrlwallet_pb2
 from qrl.generated.qrlwallet_pb2_grpc import add_WalletAPIServicer_to_server
 from qrl.core.txs.TransferTransaction import TransferTransaction
@@ -32,8 +39,18 @@ config.create_path(config.user.wallet_dir)
 pid = os.path.join(config.user.wallet_dir, 'qrl_walletd.pid')
 
 
+def wallet_operation(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._wallet_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class WalletD:
     def __init__(self):
+        ensure_private_dir(config.user.wallet_dir)
+        self._wallet_lock = RLock()
         self._wallet_path = os.path.join(config.user.wallet_dir, 'walletd.json')
         self._public_stub = qrl_pb2_grpc.PublicAPIStub(grpc.insecure_channel(config.user.public_api_server))
         self._wallet = None
@@ -142,8 +159,15 @@ class WalletD:
                                        xmss_pk=signer_pk,
                                        master_addr=master_addr)
 
+    @wallet_operation
     def load_wallet(self):
+        self._passphrase = None
         self._wallet = Wallet(self._wallet_path)
+
+    def _copy_wallet(self):
+        wallet = copy.copy(self._wallet)
+        wallet._address_items = copy.deepcopy(self._wallet.address_items)
+        return wallet
 
     @staticmethod
     def address_to_qaddress(address: bytes):
@@ -193,6 +217,7 @@ class WalletD:
     def get_pk_list_from_xmss_list(self, slave_xmss_list):
         return [xmss.pk for xmss in slave_xmss_list]
 
+    @wallet_operation
     def add_new_address(self, height=10, hash_function='shake128') -> str:
         self.authenticate()
 
@@ -208,6 +233,7 @@ class WalletD:
         logger.info("Added New Address")
         return self._wallet.address_items[-1].qaddress
 
+    @wallet_operation
     def add_new_address_with_slaves(self,
                                     height=10,
                                     number_of_slaves=config.user.number_of_slaves,
@@ -245,6 +271,7 @@ class WalletD:
         logger.info("Added New Address With Slaves")
         return self._wallet.address_items[-1].qaddress
 
+    @wallet_operation
     def add_address_from_seed(self, seed=None) -> str:
         self.authenticate()
 
@@ -265,6 +292,7 @@ class WalletD:
 
         return address_from_seed.qaddress
 
+    @wallet_operation
     def list_address(self) -> list:
         self.authenticate()
 
@@ -274,6 +302,7 @@ class WalletD:
 
         return addresses
 
+    @wallet_operation
     def remove_address(self, qaddress: str) -> bool:
         self.authenticate()
         if self._wallet.remove(qaddress):
@@ -288,6 +317,7 @@ class WalletD:
         except Exception:
             return False
 
+    @wallet_operation
     def get_recovery_seeds(self, qaddress: str):
         self.authenticate()
 
@@ -298,6 +328,7 @@ class WalletD:
 
         raise ValueError("No such address found in wallet")
 
+    @wallet_operation
     def get_wallet_info(self):
         self.authenticate()
 
@@ -309,6 +340,7 @@ class WalletD:
         resp = self._public_stub.GetAddressState(request=request)
         return AddressState(resp.state)
 
+    @wallet_operation
     def sign_and_push_transaction(self,
                                   tx,
                                   xmss,
@@ -332,6 +364,7 @@ class WalletD:
         if push_transaction_resp.error_code != qrl_pb2.PushTransactionResp.SUBMITTED:
             raise Exception(push_transaction_resp.error_description)
 
+    @wallet_operation
     def try_txn_with_last_slave(self, item, index, group_index, xmss=None):
         slave = item.slaves[group_index][-1]
 
@@ -340,9 +373,7 @@ class WalletD:
             return None
 
         slave_index = len(item.slaves[group_index]) - 1
-        slave_address_state = self.get_address_state(slave.qaddress)
-
-        ots_index = slave_address_state.get_unused_ots_index(slave.index)
+        ots_index = self.get_unused_ots_index(self.qaddress_to_address(slave.qaddress), slave.index)
 
         if ots_index is None:  # noqa
             self._wallet.set_slave_ots_index(index,
@@ -375,6 +406,7 @@ class WalletD:
             return None
         return resp.next_unused_ots_index
 
+    @wallet_operation
     def get_slave(self, master_qaddress):
         index, item = self._wallet.get_address_item(master_qaddress)
         if index is None:
@@ -395,10 +427,9 @@ class WalletD:
                 target_address_item = item.slaves[-2][-1]
                 group_index = -2
 
-            address_state = self.get_address_state(qaddress)
-            ots_index = address_state.get_unused_ots_index()
+            ots_index = self.get_unused_ots_index(self.qaddress_to_address(qaddress), 0)
 
-            if ots_index >= UNRESERVED_OTS_INDEX_START:
+            if ots_index is None or ots_index >= UNRESERVED_OTS_INDEX_START:
                 raise Exception('Fatal Error!!! No reserved OTS index found')
 
             if self._passphrase:
@@ -440,12 +471,10 @@ class WalletD:
                 if self._passphrase:
                     slave = self._wallet.decrypt_address_item(slave, self._passphrase)
 
-                slave_address_state = self.get_address_state(slave.qaddress)
-
                 if slave_index + 1 == len(last_slaves) and slave.index > 2 ** slave.height - 100:
 
-                    ots_index = slave_address_state.get_unused_ots_index(0)
-                    if ots_index >= UNRESERVED_OTS_INDEX_START:
+                    ots_index = self.get_unused_ots_index(self.qaddress_to_address(slave.qaddress), 0)
+                    if ots_index is None or ots_index >= UNRESERVED_OTS_INDEX_START:
                         raise Exception("Fatal Error, no unused reserved OTS index")
 
                     curr_slave_xmss = self._wallet.get_xmss_by_item(slave, ots_index)
@@ -466,7 +495,7 @@ class WalletD:
                                                    index,
                                                    enable_save=False)
 
-                ots_index = slave_address_state.get_unused_ots_index(slave.index)
+                ots_index = self.get_unused_ots_index(self.qaddress_to_address(slave.qaddress), slave.index)
 
                 if ots_index is None:  # noqa
                     self._wallet.set_slave_ots_index(index,
@@ -594,6 +623,7 @@ class WalletD:
 
         return index, group_index, slave_index, slave_xmss
 
+    @wallet_operation
     def get_slave_list(self, qaddress) -> list:
         self.authenticate()
         _, addr_item = self._wallet.get_address_item(qaddress)
@@ -602,9 +632,7 @@ class WalletD:
         return addr_item.slaves
 
     def verify_ots(self, signer_address, xmss, user_ots_index):
-        addr_state = self.get_address_state(signer_address)
-
-        verified_ots_index = self.get_unused_ots_index(addr_state.address, xmss.ots_index)
+        verified_ots_index = self.get_unused_ots_index(self.qaddress_to_address(signer_address), xmss.ots_index)
 
         if verified_ots_index is None:  # noqa
             raise Exception("No Unused OTS key found")
@@ -615,6 +643,7 @@ class WalletD:
         else:
             xmss.set_ots_index(verified_ots_index)
 
+    @wallet_operation
     def relay_transfer_txn(self,
                            qaddresses_to: list,
                            amounts: list,
@@ -637,6 +666,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_transfer_txn_by_slave(self,
                                     qaddresses_to: list,
                                     amounts: list,
@@ -658,6 +688,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_message_txn(self,
                           message: str,
                           fee: int,
@@ -678,6 +709,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_message_txn_by_slave(self,
                                    message: str,
                                    fee: int,
@@ -697,6 +729,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_token_txn(self,
                         symbol: str,
                         name: str,
@@ -733,6 +766,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_token_txn_by_slave(self,
                                  symbol: str,
                                  name: str,
@@ -768,6 +802,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_transfer_token_txn(self,
                                  qaddresses_to: list,
                                  amounts: list,
@@ -791,6 +826,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_transfer_token_txn_by_slave(self,
                                           qaddresses_to: list,
                                           amounts: list,
@@ -813,6 +849,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_slave_txn(self,
                         slave_pks: list,
                         access_types: list,
@@ -834,6 +871,7 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def relay_slave_txn_by_slave(self,
                                  slave_pks: list,
                                  access_types: list,
@@ -854,34 +892,50 @@ class WalletD:
 
         return self.to_plain_transaction(tx.pbdata)
 
+    @wallet_operation
     def encrypt_wallet(self, passphrase: str):
+        self._passphrase = None
         if self._wallet.is_encrypted():
             raise Exception('Wallet Already Encrypted')
         if not passphrase:
             raise Exception("Missing Passphrase")
         if len(self._wallet.address_items) == 0:
             raise ValueError('Cannot be encrypted as wallet does not have any address.')
-        self._wallet.encrypt(passphrase)
-        self._wallet.save()
+        wallet = self._copy_wallet()
+        wallet.encrypt(passphrase)
+        wallet.save()
+        self._wallet = wallet
         logger.info("Wallet Encrypted")
 
+    @wallet_operation
     def lock_wallet(self):
+        self._passphrase = None
         if not self._wallet.is_encrypted():
             raise Exception('You cannot lock an unencrypted Wallet')
 
-        self._passphrase = None
         logger.info("Wallet Locked")
 
+    @wallet_operation
     def unlock_wallet(self, passphrase: str):
+        self._passphrase = None
         if not self._wallet.is_encrypted():
             raise Exception('You cannot unlock an unencrypted Wallet')
+        if not passphrase:
+            raise WalletDecryptionError('Missing Passphrase')
 
+        needs_migration = self._wallet.needs_encryption_migration()
+        wallet = self._copy_wallet()
+        wallet.decrypt(passphrase)
+        if needs_migration:
+            wallet.encrypt(passphrase)
+            wallet.save()
+            self._wallet = wallet
         self._passphrase = passphrase
-        self._wallet.decrypt(passphrase, first_address_only=True)  # Check if Password Correct
-        self._wallet.encrypt_item(0, passphrase)  # Re-Encrypt first address item
         logger.info("Wallet Unlocked")
 
+    @wallet_operation
     def change_passphrase(self, old_passphrase: str, new_passphrase: str):
+        self._passphrase = None
         if len(old_passphrase) == 0:
             raise Exception('Missing Old Passphrase')
 
@@ -891,18 +945,18 @@ class WalletD:
         if old_passphrase == new_passphrase:
             raise Exception('Old Passphrase and New Passphrase cannot be same')
 
-        self._passphrase = old_passphrase
+        if not self._wallet.is_encrypted():
+            raise WalletDecryptionError('Wallet is not encrypted')
 
-        if not self._wallet:
-            self.unlock_wallet(old_passphrase)
+        wallet = self._copy_wallet()
         try:
-            self._wallet.decrypt(old_passphrase)
+            wallet.decrypt(old_passphrase)
         except WalletDecryptionError:
             raise ValueError('Invalid Old Passphrase')
 
-        self._wallet.encrypt(new_passphrase)
-        self._wallet.save()
-        self.lock_wallet()
+        wallet.encrypt(new_passphrase)
+        wallet.save()
+        self._wallet = wallet
         logger.info("Passphrase Changed")
 
     def get_mini_transactions_by_address(self, qaddress: str, item_per_page: int, page_number: int) -> tuple:
@@ -961,6 +1015,40 @@ class WalletD:
         return self._public_stub.GetNodeState(qrl_pb2.GetNodeStateReq())
 
 
+def _start_wallet_api(walletd):
+    host = config.user.wallet_api_host
+    # Resolve localhost without DNS so the validated address is the bound address.
+    if host == 'localhost':
+        host = '127.0.0.1'
+    try:
+        address = ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        raise ValueError('Wallet API host must be a loopback IP address or localhost') from None
+    if not address.is_loopback:
+        raise ValueError('Wallet API requires a loopback address; use a local tunnel for remote access')
+    host = '[{}]'.format(address) if address.version == 6 else str(address)
+
+    ensure_private_dir(config.user.wallet_dir)
+    token = secrets.token_urlsafe(32)
+    wallet_server = grpc.server(ThreadPoolExecutor(max_workers=config.user.wallet_api_threads),
+                                maximum_concurrent_rpcs=config.user.wallet_api_max_concurrent_rpc,
+                                interceptors=(WalletAuthInterceptor(token),))
+    try:
+        add_WalletAPIServicer_to_server(WalletAPIService(walletd), wallet_server)
+        bound_port = wallet_server.add_insecure_port("{0}:{1}".format(host, config.user.wallet_api_port))
+        if not bound_port:
+            raise RuntimeError('Could not bind wallet API')
+        token_path = os.path.join(config.user.wallet_dir, 'wallet_api.token')
+        write_private_file(token_path, token.encode('ascii'))
+        wallet_server.start()
+    except Exception:
+        wallet_server.stop(0)
+        raise
+
+    logger.info('WalletAPIService Started; token file: %s', token_path)
+    return wallet_server, bound_port
+
+
 def run():
     logger.initialize_default(force_console_output=True).setLevel(logging.INFO)
     file_handler = logger.log_to_file()
@@ -972,15 +1060,7 @@ def run():
     logger.set_unhandled_exception_handler()
 
     walletd = WalletD()  # noqa
-    wallet_server = grpc.server(ThreadPoolExecutor(max_workers=config.user.wallet_api_threads),
-                                maximum_concurrent_rpcs=config.user.wallet_api_max_concurrent_rpc)
-    add_WalletAPIServicer_to_server(WalletAPIService(walletd), wallet_server)
-
-    wallet_server.add_insecure_port("{0}:{1}".format(config.user.wallet_api_host,
-                                                     config.user.wallet_api_port))
-    wallet_server.start()
-
-    logger.info("WalletAPIService Started")
+    wallet_server, _ = _start_wallet_api(walletd)
 
     try:
         while True:

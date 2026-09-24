@@ -32,8 +32,7 @@ def setup_package():
     setup(setup_requires=['pyscaffold==3.0.2'] + sphinx,
           entry_points=entry_points,
           version=versioneer.get_version(),
-          cmdclass=_cmdclass,
-          install_requires=['protobuf>=6.31.1,<7.0.0', 'grpcio-tools'])
+          cmdclass=_cmdclass)
 
 
 if __name__ == "__main__":

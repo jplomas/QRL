@@ -13,8 +13,8 @@ from qrl.core import config
 from qrl.core.Block import Block
 from qrl.core.State import State
 from qrl.core.ChainManager import ChainManager
-from qrl.core.Message import Message
 from qrl.core.MessageRequest import MessageRequest
+from qrl.core.messagereceipt import MessageReceipt
 from qrl.core.misc import logger
 from qrl.core.node import POW
 from qrl.core.p2p.IPMetadata import IPMetadata
@@ -342,7 +342,8 @@ class TestP2PFactory(TestCase):
     def test_request_full_message_we_already_have_this_message(self, m_reactor, m_logger):
         # The local node already has this message!
         mrData = qrllegacy_pb2.MRData(type=qrllegacy_pb2.LegacyMessage.SL, hash=b'1234')
-        self.factory.master_mr._hash_msg[b'1234'] = Mock(autospec=Message)
+        self.factory.master_mr.register(qrllegacy_pb2.LegacyMessage.SL, b'1234',
+                                        qrl_pb2.Transaction(public_key=b'key'))
         message_request = MessageRequest()
         message_request.peers_connection_list.append(self.channel_1)
         self.factory.master_mr._requested_hash._msg_hash_msg_request[b'1234'] = message_request
@@ -417,13 +418,29 @@ class TestP2PFactory(TestCase):
             self.factory.broadcast_tx(m_tx)
 
     def test_broadcast_block(self, m_reactor, m_logger):
-        """
-        Not much to test here, other than that it works
-        """
-        tx = Mock(autospec=TransferTransaction, public_key=b'1234')
-        b = Mock(autospec=Block, transactions=[tx], headerhash=bhstr2bin('1234'), block_number=1,
-                 prev_headerhash=bhstr2bin('deadbeef'))
-        self.factory.broadcast_block(b)
+        pbdata = qrl_pb2.Block()
+        pbdata.header.hash_header = b'block'
+        pbdata.header.block_number = 1
+        pbdata.header.hash_header_prev = b'parent'
+        pbdata.transactions.add().coinbase.SetInParent()
+        block = Block(pbdata)
+
+        self.factory.broadcast_block(block)
+
+        announcement = self.channel_1.send.call_args[0][0].mrData
+        receipt = MessageReceipt()
+        receipt.add_peer(block.headerhash, qrllegacy_pb2.LegacyMessage.BK, self.channel_1, announcement)
+        self.assertTrue(receipt.isRequested(block.headerhash, self.channel_1, block))
+
+    def test_rejected_cache_entry_is_not_announced(self, m_reactor, m_logger):
+        tx = qrl_pb2.Transaction(public_key=b'oversized')
+        with patch.object(config.dev, 'message_cache_max_bytes', tx.ByteSize() - 1):
+            self.factory.register_and_broadcast(qrllegacy_pb2.LegacyMessage.TX, b'tx', tx)
+
+        self.assertFalse(self.factory.master_mr.contains(b'tx', qrllegacy_pb2.LegacyMessage.TX))
+        self.channel_1.send.assert_not_called()
+        self.channel_2.send.assert_not_called()
+        self.channel_3.send.assert_not_called()
 
     def test_get_random_peer(self, m_reactor, m_logger):
         """

@@ -5,7 +5,7 @@ jobs:
       - image: qrledger/qrl-docker-ci:noble
     steps:
       - checkout
-      - run: source /opt/venv/bin/activate
+      - run: echo 'source /opt/venv/bin/activate' >> "$BASH_ENV"
       - run: pip install -U setuptools
       - run: pip install -U -r requirements.txt
       - run: pip install -U -r test-requirements.txt
@@ -31,7 +31,7 @@ jobs:
       - image: qrledger/qrl-docker-ci:noble
     steps:
       - checkout
-      - run: source /opt/venv/bin/activate
+      - run: echo 'source /opt/venv/bin/activate' >> "$BASH_ENV"
       - run: pip install flake8
       - run: pip install -U setuptools
       - run: python3 -m flake8 -v --show-source --statistics ./src ./tests
@@ -76,7 +76,7 @@ jobs:
     #  TESTINPLACE: 1
     steps:
       - checkout
-      - run: git submodule update --init --recursive --remote
+      - run: git submodule update --init --recursive
       - run: pip install -U -r tests_integration/requirements.txt
       - run: ls tests_integration/tmp
       - run: pytest tests_integration/tests/python/fastnet_long
@@ -89,7 +89,7 @@ jobs:
     #  TESTINPLACE: 1
     steps:
       - checkout
-      - run: git submodule update --init --recursive --remote
+      - run: git submodule update --init --recursive
       - run: pip install -U -r requirements.txt
       - run: pip install -U -r tests_integration/requirements.txt
       - run: chmod +x tests_integration/mocknet/*.sh

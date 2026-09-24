@@ -3,14 +3,28 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 import ipaddress
 from unittest import TestCase
+from unittest.mock import patch
 
 from pyqrllib.pyqrllib import str2bin
 from qrl.core import config
+from qrl.core.Block import Block
 from qrl.core.misc import logger
 from qrl.core.messagereceipt import MessageReceipt
+from qrl.generated import qrl_pb2, qrllegacy_pb2
 from qrl.generated.qrllegacy_pb2 import LegacyMessage
 
 logger.initialize_default()
+
+
+def make_block(block_number=11, prev_headerhash=b'parent', public_key=b'', headerhash=b'block'):
+    pbdata = qrl_pb2.Block()
+    pbdata.header.hash_header = headerhash
+    pbdata.header.block_number = block_number
+    pbdata.header.hash_header_prev = prev_headerhash
+    coinbase = pbdata.transactions.add()
+    coinbase.coinbase.SetInParent()
+    coinbase.public_key = public_key
+    return Block(pbdata)
 
 
 class TestMessageReceipt(TestCase):
@@ -36,7 +50,7 @@ class TestMessageReceipt(TestCase):
         mr = MessageReceipt()
 
         msg_hash = str2bin("asdf")
-        msg_obj = [1, 2, 3, 4]
+        msg_obj = qrl_pb2.Transaction(public_key=b'key')
         msg_type = mr.allowed_types[0]
 
         mr.register(msg_type, msg_hash, msg_obj)
@@ -45,7 +59,7 @@ class TestMessageReceipt(TestCase):
         mr = MessageReceipt()
 
         msg_hash = str2bin("hash_valid")
-        msg_obj = [1, 2, 3, 4]
+        msg_obj = qrl_pb2.Transaction(public_key=b'key')
         msg_type = mr.allowed_types[0]
         peer = '127.0.0.1'
 
@@ -187,22 +201,101 @@ class TestMessageReceipt(TestCase):
         mr = MessageReceipt()
 
         msg_hash = str2bin("hash_valid")
-        msg_obj = [1, 2, 3, 4]
+        msg_obj = qrl_pb2.Transaction(public_key=b'key')
         msg_type = mr.allowed_types[0]
 
         mr.register(msg_type, msg_hash, msg_obj)
         self.assertTrue(mr.contains(msg_hash, msg_type))
 
+    def test_requested_block_matches_its_own_peer_announcement(self):
+        mr = MessageReceipt()
+        block = make_block()
+        first_peer = object()
+        second_peer = object()
+        first_announcement = qrllegacy_pb2.MRData(hash=block.headerhash,
+                                                    type=LegacyMessage.BK,
+                                                    block_number=block.block_number,
+                                                    prev_headerhash=block.prev_headerhash)
+        second_announcement = qrllegacy_pb2.MRData(hash=block.headerhash,
+                                                     type=LegacyMessage.BK,
+                                                     block_number=block.block_number + 1,
+                                                     prev_headerhash=block.prev_headerhash)
+        mr.add_peer(block.headerhash, LegacyMessage.BK, first_peer, first_announcement)
+        mr.add_peer(block.headerhash, LegacyMessage.BK, second_peer, second_announcement)
+        mr.add_peer(block.headerhash, LegacyMessage.TX, object(),
+                    qrllegacy_pb2.MRData(hash=block.headerhash, type=LegacyMessage.TX))
+
+        self.assertTrue(mr.isRequested(block.headerhash, first_peer, block))
+        self.assertFalse(mr.isRequested(block.headerhash, second_peer, block))
+        self.assertTrue(mr.isRequested(block.headerhash, first_peer, block))
+        self.assertFalse(mr.isRequested(block.headerhash, object(), block))
+
+    def test_requested_block_rejects_mismatched_or_missing_fields(self):
+        cases = [make_block(block_number=12),
+                 make_block(prev_headerhash=b'other'),
+                 make_block(public_key=b'other'),
+                 make_block(headerhash=b'other')]
+        empty_block = make_block()
+        empty_block.pbdata.ClearField('transactions')
+        cases.append(empty_block)
+
+        for block in cases:
+            with self.subTest(block=block.pbdata):
+                mr = MessageReceipt()
+                peer = object()
+                announcement = qrllegacy_pb2.MRData(hash=b'block',
+                                                       type=LegacyMessage.BK,
+                                                       block_number=11,
+                                                       prev_headerhash=b'parent')
+                mr.add_peer(b'block', LegacyMessage.BK, peer, announcement)
+                self.assertFalse(mr.isRequested(b'block', peer, block))
+                self.assertIsNone(mr.get_msg_request(b'block'))
+
     def test_register_overflow(self):
         mr = MessageReceipt()
 
-        msg_obj = [1, 2, 3, 4]
+        msg_obj = qrl_pb2.Transaction(public_key=b'key')
         msg_type = mr.allowed_types[0]
 
-        config.dev.message_q_size = 4
+        with patch.object(config.dev, 'message_q_size', 4):
+            for i in range(config.dev.message_q_size * 2):
+                msg_hash = str2bin(str(i))
+                mr.register(msg_type, msg_hash, msg_obj)
 
-        for i in range(config.dev.message_q_size * 2):
-            msg_hash = str2bin(str(i))
-            mr.register(msg_type, msg_hash, msg_obj)
+            self.assertEqual(len(mr._hash_msg), config.dev.message_q_size)
 
-        self.assertEqual(len(mr._hash_msg), config.dev.message_q_size)
+    def test_register_byte_budget_and_deregister(self):
+        mr = MessageReceipt()
+        first = qrl_pb2.Transaction(public_key=b'first')
+        second = qrl_pb2.Transaction(public_key=b'second')
+        size = first.ByteSize()
+
+        with patch.object(config.dev, 'message_cache_max_bytes', size + second.ByteSize() - 1):
+            self.assertTrue(mr.register(LegacyMessage.TX, b'first', first))
+            self.assertTrue(mr.register(LegacyMessage.TX, b'second', second))
+            self.assertFalse(mr.contains(b'first', LegacyMessage.TX))
+            self.assertTrue(mr.contains(b'second', LegacyMessage.TX))
+            self.assertEqual(mr._cache_bytes, second.ByteSize())
+            mr.deregister(b'second', LegacyMessage.TX)
+            self.assertEqual(mr._cache_bytes, 0)
+
+    def test_register_rejects_oversized_entry(self):
+        mr = MessageReceipt()
+        entry = qrl_pb2.Transaction(public_key=b'oversized')
+        with patch.object(config.dev, 'message_cache_max_bytes', entry.ByteSize() - 1):
+            self.assertFalse(mr.register(LegacyMessage.TX, b'entry', entry))
+        self.assertFalse(mr.contains(b'entry', LegacyMessage.TX))
+        self.assertEqual(mr._cache_bytes, 0)
+
+    @patch('qrl.core.messagereceipt.monotonic')
+    def test_cache_entry_expires(self, clock):
+        mr = MessageReceipt()
+        entry = qrl_pb2.Transaction(public_key=b'key')
+        clock.return_value = 100
+        with patch.object(config.dev, 'message_cache_ttl', 10):
+            self.assertTrue(mr.register(LegacyMessage.TX, b'entry', entry))
+            clock.return_value = 109
+            self.assertIsNotNone(mr.get(LegacyMessage.TX, b'entry'))
+            clock.return_value = 110
+            self.assertIsNone(mr.get(LegacyMessage.TX, b'entry'))
+        self.assertEqual(mr._cache_bytes, 0)

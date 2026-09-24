@@ -162,7 +162,7 @@ class AddressState(object):
         return address_state
 
     def ots_key_reuse(self, ots_key_index):
-        if ots_key_index < config.dev.max_ots_tracking_index:
+        if ots_key_index >> 3 < self._tracked_ots_bytes():
             offset = ots_key_index >> 3
             relative = ots_key_index % 8
             bitfield = bytearray(self.ots_bitfield[offset])
@@ -175,6 +175,11 @@ class AddressState(object):
                 return True
 
         return False
+
+    def _tracked_ots_bytes(self):
+        if len(self.ots_bitfield) > config.dev.ots_bitfield_size:
+            return len(self.ots_bitfield)
+        return min(len(self.ots_bitfield), config.dev.max_ots_tracking_index // 8)
 
     def set_ots_key(self, ots_key_index):
         if ots_key_index < config.dev.max_ots_tracking_index:
@@ -208,7 +213,8 @@ class AddressState(object):
         """
         ots_key_count = (2 ** self.height)
 
-        for i in range(start_ots_index // 8, min(ots_key_count, config.dev.max_ots_tracking_index) // 8):
+        tracked_bytes = self._tracked_ots_bytes()
+        for i in range(start_ots_index // 8, min(ots_key_count // 8, tracked_bytes)):
             if self.ots_bitfield[i][0] < 255:
                 offset = 8 * i
                 bitfield = bytearray(self.ots_bitfield[i])
@@ -216,6 +222,9 @@ class AddressState(object):
                     if ((bitfield[0] >> relative) & 1) != 1:
                         if offset + relative >= start_ots_index:
                             return offset + relative
+
+        if tracked_bytes * 8 >= ots_key_count:
+            return None
 
         if ots_key_count >= config.dev.max_ots_tracking_index:
             if self.ots_counter + 1 < ots_key_count:

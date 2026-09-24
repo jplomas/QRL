@@ -68,7 +68,9 @@ class DependencyChecker:
                 # Fallback to pkg_resources
                 if pkg_resources is None:
                     raise ImportError("Neither modern packaging nor pkg_resources is available")
-                pkg_resources.require(requirements)
+                clean_requirements = [req for line in requirements
+                                      if (req := line.split('#', 1)[0].strip())]
+                pkg_resources.require(clean_requirements)
 
             # Check git-based requirements separately
             missing_git_packages = []

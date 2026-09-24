@@ -33,3 +33,13 @@ class TestDependencyChecker(TestCase):
 
                 DependencyChecker.check()
                 sys.exit.assert_called()
+
+    def test_pkg_resources_fallback_strips_inline_comments(self):
+        requirements = 'protobuf>=4.21.0,<7.0.0  # gRPC\n   # comment\n\n'
+        module = 'qrl.core.misc.DependencyChecker'
+        with mock.patch(f'{module}.MODERN_PACKAGING', False), \
+                mock.patch(f'{module}.pkg_resources') as pkg_resources, \
+                mock.patch('builtins.open', mock.mock_open(read_data=requirements)):
+            DependencyChecker.check()
+
+        pkg_resources.require.assert_called_once_with(['protobuf>=4.21.0,<7.0.0'])
